@@ -285,5 +285,7 @@ int main() {
     printf("%s", formatted);
     free(formatted);
 
+    system("pause");
+    
     return 0;
 }
