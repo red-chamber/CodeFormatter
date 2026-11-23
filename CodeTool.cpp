@@ -2,7 +2,10 @@
 //
 // 功能:
 //   1) 紧凑代码: 删除多余空格(运算符两侧、参数两侧、逗号后等),
-//      保留 int a; / if(x) 里的必要空格, 不改变语法, 只删不补。
+//      保留 int a; 等必要空格, 同行的 if/for/while 无花括号语句体前补一个空格。
+//      函数形参和调用实参各收拢到一行, 函数左花括号跟随函数名, 右花括号另起一行。
+//      赋值、流运算符等表达式续行并到同一行。
+//      if/for/while 的单行单语句块在可以保持语义时去掉外层花括号。
 //   2) 删除注释: 删除 // 与 /* */ 注释, 字符串/字符常量里的内容不动。
 //   3) 紧凑+删注释: 先删注释再紧凑。
 //   4) 变量/函数改名: 列出输入代码中名字长度超过 4 的变量和函数及出现次数,
@@ -107,6 +110,8 @@ struct Token {
     Kind kind;
     std::string text;
     bool tclose = false;   // 该 > 是模板参数列表的收尾
+    bool topen = false;    // 配对的模板参数列表开头
+    bool spaceAfterControl = false;   // 该 ) 后的控制语句体没有花括号
 };
 
 bool isWordByte(unsigned char c) {
@@ -330,7 +335,7 @@ bool mergeRisk(const std::string& l, const std::string& r) {
 // 标记"模板参数列表收尾的 >",仅用于排版时在该 > 后留一个空格。
 // 判错了也只是多/少一个空格,不影响语法。
 void markTemplateClosers(std::vector<Token>& toks) {
-    struct Angle { bool valid; };
+    struct Angle { Token* open; bool valid; };
     std::vector<Angle> stack;
     const Token* prev = nullptr;
 
@@ -342,22 +347,27 @@ void markTemplateClosers(std::vector<Token>& toks) {
             if (s == "<") {
                 bool typeish = prev && (prev->kind == Kind::IDENT ||
                                         prev->text == ">" || prev->text == "::");
-                stack.push_back({typeish});
+                stack.push_back({&t, typeish});
             } else if (s == ">") {
                 if (!stack.empty()) {
-                    if (stack.back().valid) t.tclose = true;
+                    if (stack.back().valid) {
+                        t.tclose = true;
+                        stack.back().open->topen = true;
+                    }
                     stack.pop_back();
                 }
             } else if (s == ">>") {
                 // C++11 中 vector<vector<int>> 用 >> 收尾,可能是两层模板
                 if (!stack.empty()) {
-                    bool ok = stack.back().valid;
+                    Angle inner = stack.back();
                     stack.pop_back();
-                    if (!stack.empty()) {
-                        ok = ok && stack.back().valid;
-                        stack.pop_back();
+                    Angle outer = stack.empty() ? inner : stack.back();
+                    if (!stack.empty()) stack.pop_back();
+                    if (inner.valid && outer.valid) {
+                        t.tclose = true;
+                        inner.open->topen = true;
+                        outer.open->topen = true;
                     }
-                    t.tclose = ok;
                 }
             } else if (s == ";" || s == "{" || s == "}" || s == ")" ||
                        s == "&&" || s == "||" || s == "?" || s == "=" ||
@@ -370,8 +380,42 @@ void markTemplateClosers(std::vector<Token>& toks) {
     }
 }
 
+bool isControlHeader(const Token* prev, const Token* beforePrev) {
+    if (prev && prev->text == "constexpr") prev = beforePrev;
+    return prev && prev->kind == Kind::IDENT &&
+           (prev->text == "if" || prev->text == "while" || prev->text == "for");
+}
+
+// 配对圆括号,在无花括号的控制语句体之前标记条件的右括号。
+void markControlClosers(std::vector<Token>& toks) {
+    std::vector<bool> controlParens;
+    const Token* prev = nullptr;
+    const Token* beforePrev = nullptr;
+    Token* controlClose = nullptr;
+
+    for (auto& t : toks) {
+        if (t.kind == Kind::WS || t.kind == Kind::COMMENT) continue;
+
+        if (controlClose) {
+            controlClose->spaceAfterControl =
+                t.kind != Kind::RAW && t.text != "{" && t.text != "<%";
+            controlClose = nullptr;
+        }
+
+        if (t.kind == Kind::PUNCT && t.text == "(") {
+            controlParens.push_back(isControlHeader(prev, beforePrev));
+        } else if (t.kind == Kind::PUNCT && t.text == ")" && !controlParens.empty()) {
+            if (controlParens.back()) controlClose = &t;
+            controlParens.pop_back();
+        }
+
+        beforePrev = prev;
+        prev = &t;
+    }
+}
+
 // 判断 seq[i-1] 与 seq[i] 之间是否需要保留一个空格
-// hadSpace: 源码里这两个 token 之间本来是否有空白(本工具只删不补)
+// hadSpace: 源码里这两个 token 之间本来是否有空白
 bool needSpace(const std::vector<const Token*>& seq, size_t i,
                bool inBlockBrace, bool hadSpace) {
     const Token& a = *seq[i - 1];
@@ -393,6 +437,9 @@ bool needSpace(const std::vector<const Token*>& seq, size_t i,
 
     // 2) 运算符拼接会变成别的 token,必须留空格
     if (mergeRisk(lt, rt)) return true;
+
+    // 同行的无花括号语句体前留一个空格,即使源码本来没有
+    if (a.spaceAfterControl) return true;
 
     // 以下是"美观"规则:只有源码本来就有空白才保留,不凭空添加
     if (!hadSpace) return false;
@@ -519,7 +566,8 @@ std::string collapseBlankLinesInCode(const std::string& code) {
     return out;
 }
 
-std::string render(const std::vector<Token>& toks) {
+std::string render(const std::vector<Token>& toks,
+                   const std::map<size_t, std::string>& closingLines) {
     // 非空白 token 序列,排版时用来前后查找
     std::vector<const Token*> seq;
     seq.reserve(toks.size());
@@ -532,12 +580,18 @@ std::string render(const std::vector<Token>& toks) {
     std::vector<bool> braceStack;   // 每层 { 是否为语句块(而不是初始化列表)
 
     size_t si = 0;                  // 当前非空白 token 在 seq 中的下标
-    for (const auto& t : toks) {
+    auto closingLine = closingLines.begin();
+    for (size_t ti = 0; ti < toks.size(); ++ti) {
+        const Token& t = toks[ti];
         if (t.kind == Kind::WS) {
             pending += t.text;
             continue;
         }
         bool inBlock = !braceStack.empty() && braceStack.back();
+        if (closingLine != closingLines.end() && closingLine->first == ti) {
+            if (pending.find('\n') == std::string::npos) pending = closingLine->second;
+            ++closingLine;
+        }
         bool hasNewline = pending.find('\n') != std::string::npos;
         bool hadSpace = !pending.empty();
 
@@ -581,17 +635,6 @@ std::vector<std::pair<int, std::string>> signature(const std::vector<Token>& tok
         if (t.kind != Kind::WS) sig.emplace_back(static_cast<int>(t.kind), t.text);
     }
     return sig;
-}
-
-std::string compact(const std::string& text) {
-    std::vector<Token> before = tokenize(text);
-    markTemplateClosers(before);
-    std::string out = render(before);
-    std::vector<Token> after = tokenize(out);
-    if (signature(before) != signature(after)) {
-        throw std::runtime_error("压缩后 token 序列发生变化,已放弃(请反馈该源文件)");
-    }
-    return out;
 }
 
 // ============================ 删除注释 ============================
@@ -892,6 +935,558 @@ bool startsNewDecl(const std::vector<const Token*>& t, size_t pos) {
     if (i >= end || t[i]->kind != Kind::IDENT) return false;
     return true;
 }
+
+// ============================ 函数与控制语句排版 ============================
+
+constexpr size_t noToken = std::string::npos;
+
+bool hasLineBreak(const std::string& text) {
+    return text.find_first_of("\r\n") != std::string::npos;
+}
+
+bool canJoinLines(const Token& token) {
+    if (token.kind == Kind::WS) return true;
+    if (token.kind == Kind::RAW || hasLineBreak(token.text)) return false;
+    if (token.kind == Kind::COMMENT && startsWith(token.text, 0, "//")) return false;
+    return token.kind != Kind::PUNCT || token.text != "\\";
+}
+
+// code 使用非空白、非注释的下标,source 保存对应的原始 token 下标。
+struct LayoutTokens {
+    std::vector<const Token*> code;
+    std::vector<size_t> source;
+    std::vector<size_t> mate;
+    std::vector<size_t> parent;
+
+    explicit LayoutTokens(const std::vector<Token>& toks) {
+        std::vector<size_t> open;
+        for (size_t i = 0; i < toks.size(); ++i) {
+            const Token& t = toks[i];
+            if (t.kind == Kind::WS || t.kind == Kind::COMMENT) continue;
+
+            size_t pos = code.size();
+            code.push_back(&t);
+            source.push_back(i);
+            mate.push_back(noToken);
+            parent.push_back(open.empty() ? noToken : open.back());
+            if (t.kind != Kind::PUNCT) continue;
+
+            const auto& s = t.text;
+            if (s == "(" || s == "[" || s == "{" || s == "<%" || s == "<:") {
+                open.push_back(pos);
+            } else if ((s == ")" || s == "]" || s == "}" || s == "%>" || s == ":>") &&
+                       !open.empty()) {
+                size_t left = open.back();
+                const auto& l = (*this)[left];
+                if ((l == "(" && s == ")") ||
+                    ((l == "[" || l == "<:") && (s == "]" || s == ":>")) ||
+                    ((l == "{" || l == "<%") && (s == "}" || s == "%>"))) {
+                    mate[left] = pos;
+                    mate[pos] = left;
+                    open.pop_back();
+                } else {
+                    open.clear();
+                }
+            }
+        }
+    }
+
+    const std::string& operator[](size_t i) const {
+        static const std::string empty;
+        return i < code.size() ? code[i]->text : empty;
+    }
+
+    size_t afterGroup(size_t i) const {
+        return mate[i] != noToken && mate[i] > i ? mate[i] + 1 : i + 1;
+    }
+
+    bool identifier(size_t i) const {
+        return i < code.size() && code[i]->kind == Kind::IDENT &&
+               !KEYWORDS.count((*this)[i]);
+    }
+
+    bool opensBlock(size_t i) const {
+        return (*this)[i] == "{" || (*this)[i] == "<%";
+    }
+};
+
+bool isAttribute(const LayoutTokens& t, size_t i) {
+    return t[i] == "[" && t[i + 1] == "[" && t.mate[i] != noToken;
+}
+
+// 向左跳过模板实参。跳过已配对的括号,避免把其中的比较符号当作尖括号。
+size_t findAngleOpen(const LayoutTokens& t, size_t close) {
+    size_t depth = 0;
+    for (size_t i = close + 1; i > 0;) {
+        --i;
+        const auto& s = t[i];
+        if (s == ">") ++depth;
+        else if (s == ">>") depth += 2;
+        else if (s == "<") {
+            if (--depth == 0) return i;
+        } else if (s == ";" || s == "{" || s == "}" || t.code[i]->kind == Kind::RAW) {
+            break;
+        } else if (t.mate[i] != noToken && t.mate[i] < i) {
+            i = t.mate[i];
+        } else if (s == "=" || s == "&&" || s == "||" || s == "?") {
+            break;
+        }
+    }
+    return noToken;
+}
+
+size_t namePart(const LayoutTokens& t, size_t last) {
+    if (t[last] == ">" || t[last] == ">>") {
+        size_t angle = findAngleOpen(t, last);
+        if (angle == noToken || angle == 0) return noToken;
+        last = angle - 1;
+    }
+    return t.identifier(last) ? last : noToken;
+}
+
+struct FunctionName {
+    size_t first = noToken;
+    size_t unqualified = noToken;
+    size_t owner = noToken;
+};
+
+FunctionName findFunctionName(const LayoutTokens& t, size_t open) {
+    if (open == 0) return {};
+    size_t last = open - 1;
+    if (t[last] == "]" && t.mate[last] != noToken && isAttribute(t, t.mate[last])) {
+        if (t.mate[last] == 0) return {};
+        last = t.mate[last] - 1;
+    }
+    size_t name = namePart(t, last);
+    if (last > 0 && t[last - 1] == "operator") {
+        name = last - 1;  // operator+, operator bool, operator new 等
+    } else if ((t[last] == ")" || t[last] == "]") && t.mate[last] != noToken &&
+               t.mate[last] > 0 && t[t.mate[last] - 1] == "operator") {
+        name = t.mate[last] - 1;  // operator()、operator[]
+    }
+    if (name == noToken) return {};
+
+    size_t first = name;
+    if (first > 0 && t[first - 1] == "~") --first;
+    size_t owner = noToken;
+    while (first > 0 && t[first - 1] == "::") {
+        size_t part = first >= 2 ? namePart(t, first - 2) : noToken;
+        if (part == noToken) { --first; break; }  // 全局限定符 ::
+        if (owner == noToken) owner = part;
+        first = part;
+    }
+    return {first, name, owner};
+}
+
+bool isFunctionPrefixBoundary(const LayoutTokens& t, size_t i) {
+    const auto& s = t[i];
+    return s == ";" || s == ":" || t.opensBlock(i) || s == "}" || s == "%>" ||
+           t.code[i]->kind == Kind::RAW;
+}
+
+bool isClassMemberWithoutType(const LayoutTokens& t, const FunctionName& name, size_t scope) {
+    if (name.owner != noToken) {
+        return t[name.unqualified] == t[name.owner] || t[name.unqualified] == "operator";
+    }
+    if (scope == noToken) return false;
+    for (size_t i = scope; i > 0;) {
+        --i;
+        if (isFunctionPrefixBoundary(t, i) && t[i] != ":") break;
+        if (t.mate[i] != noToken && t.mate[i] < i) {
+            i = t.mate[i];
+            continue;
+        }
+        if (t[i] == "class" || t[i] == "struct" || t[i] == "union") {
+            size_t className = i + 1;
+            while (isAttribute(t, className)) className = t.afterGroup(className);
+            return t.identifier(className) &&
+                   (t[className] == t[name.unqualified] || t[name.unqualified] == "operator");
+        }
+    }
+    return false;
+}
+
+bool hasFunctionPrefix(const LayoutTokens& t, const FunctionName& name, size_t scope) {
+    bool hasType = false;
+    for (size_t i = name.first; i > 0;) {
+        --i;
+        if (isFunctionPrefixBoundary(t, i)) break;
+        const auto& s = t[i];
+        if (s == "::" || s == "*" || s == "&" || s == "&&" || s == "export") continue;
+        if (s == ">" || s == ">>") {
+            size_t open = findAngleOpen(t, i);
+            if (open == noToken) return false;
+            i = open;
+            if (i > 0 && t[i - 1] == "template") --i;
+            continue;
+        }
+        if (s == "]" && t.mate[i] != noToken && isAttribute(t, t.mate[i])) {
+            i = t.mate[i];
+            continue;
+        }
+        if (s == ")" && t.mate[i] != noToken && t.mate[i] > 0) {
+            i = t.mate[i] - 1;
+            if (t[i] == "decltype") hasType = true;
+            else if (t[i] != "alignas" && t[i] != "__declspec" && t[i] != "__attribute__") {
+                return false;
+            }
+            continue;
+        }
+        if (t.code[i]->kind == Kind::STRING && i > 0 && t[i - 1] == "extern") {
+            --i;
+            continue;
+        }
+        if (t.identifier(i) || isBuiltinTypeKw(s) || s == "signed" || s == "unsigned" ||
+            s == "short" || s == "long") {
+            hasType = true;
+        } else if (!isSpecKw(s)) {
+            return false;
+        }
+    }
+    return hasType || isClassMemberWithoutType(t, name, scope);
+}
+
+bool functionEnding(const LayoutTokens& t, size_t i) {
+    const auto& s = t[i];
+    return s == ";" || s == "=" || s == ":" || t.opensBlock(i) || s == "try";
+}
+
+// 跳过函数限定符、尾置返回类型、约束和构造函数初始化列表,定位函数体或声明终点。
+size_t findFunctionEnd(const LayoutTokens& t, size_t paramClose) {
+    size_t i = paramClose + 1;
+    while (i < t.code.size()) {
+        const auto& s = t[i];
+        if (isAttribute(t, i)) {
+            i = t.afterGroup(i);
+        } else if (s == "noexcept" || s == "throw") {
+            ++i;
+            if (t[i] == "(" && t.mate[i] != noToken) i = t.afterGroup(i);
+        } else if (s == "const" || s == "volatile" || s == "&" || s == "&&" ||
+                   s == "override" || s == "final" || s == "mutable") {
+            ++i;
+        } else {
+            break;
+        }
+    }
+    if (t[i] == "->" || t[i] == "requires") {
+        bool inConstraint = t[i] == "requires";
+        for (++i; i < t.code.size() && !functionEnding(t, i); i = t.afterGroup(i)) {
+            if (t.code[i]->kind == Kind::RAW || t[i] == "}" || t[i] == "%>") return noToken;
+            if (t[i] == "requires") {
+                if (inConstraint) {
+                    size_t expr = i + 1;
+                    if (t[expr] == "(" && t.mate[expr] != noToken) expr = t.afterGroup(expr);
+                    if (t.opensBlock(expr) && t.mate[expr] != noToken) i = t.mate[expr];
+                }
+                inConstraint = true;
+            }
+        }
+    }
+    if (t[i] == "try") ++i;
+    if (t[i] == ":") {
+        do {
+            ++i;
+            while (i < t.code.size() &&
+                   (t.identifier(i) || t[i] == "::" || t[i] == "<")) {
+                if (t[i] == "<") {
+                    if (!skipAngles(t.code, i)) return noToken;
+                } else {
+                    ++i;
+                }
+            }
+            if ((t[i] != "(" && !t.opensBlock(i)) || t.mate[i] == noToken) return noToken;
+            i = t.afterGroup(i);
+            if (t[i] == "...") ++i;
+        } while (t[i] == ",");
+    }
+    if (t.opensBlock(i) && t.mate[i] != noToken) return i;
+    if (t[i] == ";" || t[i] == "," ||
+        (t[i] == "=" && (t[i + 1] == "default" || t[i + 1] == "delete" || t[i + 1] == "0"))) {
+        return i;
+    }
+    return noToken;
+}
+
+bool isFunctionDeclaration(const LayoutTokens& t, size_t open, size_t close) {
+    if (t[open + 1] == "..." || looksLikeParamList(t.code, open)) return true;
+    // 匿名参数可以只有自定义类型,例如 f(T) 或 f(std::unique_ptr<T>)。
+    size_t i = open + 1;
+    bool confident = false;
+    if (!parseTypePrefix(t.code, i, confident)) return false;
+    while (t[i] == "*" || t[i] == "&" || t[i] == "&&" || t[i] == "const" ||
+           t[i] == "volatile" || t[i] == "...") ++i;
+    return i == close || (i < close && t[i] == ",");
+}
+
+std::unordered_set<std::string> definedMacros(const std::vector<Token>& toks) {
+    std::unordered_set<std::string> names;
+    for (const auto& t : toks) {
+        if (t.kind != Kind::RAW || t.text.empty() || t.text.front() != '#') continue;
+        const auto& s = t.text;
+        size_t pos = 1;
+        while (pos < s.size() && isWsByte(s[pos])) ++pos;
+        size_t start = pos;
+        while (pos < s.size() && isWordByte(s[pos])) ++pos;
+        if (s.compare(start, pos - start, "define") != 0) continue;
+        while (pos < s.size() && isWsByte(s[pos])) ++pos;
+        start = pos;
+        while (pos < s.size() && isWordByte(s[pos])) ++pos;
+        if (pos > start) names.insert(s.substr(start, pos - start));
+    }
+    return names;
+}
+
+// 仅去掉单行、单条语句的外层花括号。宏展开、声明、标签和嵌套控制流可能改变语义。
+bool isSingleLineBody(const LayoutTokens& t, const std::vector<Token>& toks,
+                      const std::vector<bool>& inlineToken,
+                      const std::unordered_set<std::string>& macros, size_t first, size_t close) {
+    if (first == close || t[close - 1] != ";") return false;
+    size_t statement = first;
+    while (statement < close - 1 && isAttribute(t, statement)) {
+        statement = t.afterGroup(statement);
+    }
+    const auto& start = t[statement];
+    bool jump = start == "break" || start == "continue" || start == "goto" ||
+                start == "return" || start == "co_return" || start == "throw" ||
+                start == "co_yield" || start == "co_await" || start == "delete" || start == "new";
+    if (!jump && (isStmtBlockKw(start) || isBuiltinTypeKw(start) || isSpecKw(start) ||
+                  startsNewDecl(t.code, statement))) return false;
+    if (start == ";") return false;
+
+    for (size_t i = t.source[first]; i <= t.source[close - 1]; ++i) {
+        const Token& token = toks[i];
+        if (!canJoinLines(token) || (!inlineToken[i] && hasLineBreak(token.text)) ||
+            (token.kind == Kind::IDENT && macros.count(token.text))) return false;
+    }
+
+    size_t conditional = 0;
+    for (size_t i = first; i < close - 1;) {
+        const auto& s = t[i];
+        if (s == ";") return false;
+        if (s == "?") ++conditional;
+        if (s == ":") {
+            if (conditional == 0) return false;  // 标签
+            --conditional;
+        }
+        size_t next = t.afterGroup(i);
+        if (next >= close) return false;
+        i = next;
+    }
+    return true;
+}
+
+bool onlyWhitespace(const std::vector<Token>& toks, size_t first, size_t last) {
+    for (size_t i = first; i < last; ++i) {
+        if (toks[i].kind != Kind::WS) return false;
+    }
+    return true;
+}
+
+// 找到函数名所在行的原始行首缩进,供新插入的右花括号行复用。
+std::string lineIndent(const std::vector<Token>& toks, size_t pos) {
+    while (pos > 0) {
+        const Token& t = toks[--pos];
+        size_t line = t.text.rfind('\n');
+        if (line != std::string::npos) {
+            return t.kind == Kind::WS ? t.text.substr(line + 1) : std::string{};
+        }
+    }
+    return {};
+}
+
+bool opensControlHeader(const LayoutTokens& t, size_t open) {
+    const Token* prev = open > 0 ? t.code[open - 1] : nullptr;
+    const Token* beforePrev = open > 1 ? t.code[open - 2] : nullptr;
+    return isControlHeader(prev, beforePrev);
+}
+
+bool followsStatementHeader(const LayoutTokens& t, size_t prev) {
+    if (t[prev] != ")" || t.mate[prev] == noToken) return false;
+    size_t open = t.mate[prev];
+    return opensControlHeader(t, open) ||
+           (open > 0 && (t[open - 1] == "switch" || t[open - 1] == "catch"));
+}
+
+bool isCallOrParameterList(const LayoutTokens& t, size_t open) {
+    if (open == 0 || opensControlHeader(t, open)) return false;
+    size_t prev = open - 1;
+    if (t.identifier(prev) || t.code[prev]->tclose) return true;
+    if (t[prev] == "]" && t.mate[prev] != noToken) return !isAttribute(t, t.mate[prev]);
+    return t[prev] == ")" && t.mate[prev] != noToken && !followsStatementHeader(t, prev);
+}
+
+// 先收集可并到一行的范围,再合并重叠范围。嵌套调用中的空白只需处理一次。
+class LineJoins {
+    const std::vector<Token>& toks;
+    std::vector<size_t> barriers;
+    std::vector<std::pair<size_t, size_t>> ranges;
+
+public:
+    explicit LineJoins(const std::vector<Token>& tokens) : toks(tokens) {
+        for (size_t i = 0; i < toks.size(); ++i) {
+            if (!canJoinLines(toks[i])) barriers.push_back(i);
+        }
+    }
+
+    void between(size_t left, size_t right) {
+        if (right <= left + 1) return;
+        auto barrier = std::lower_bound(barriers.begin(), barriers.end(), left);
+        if (barrier == barriers.end() || *barrier > right) ranges.emplace_back(left + 1, right);
+    }
+
+    void mark(std::vector<bool>& inlineToken) {
+        std::sort(ranges.begin(), ranges.end());
+        size_t next = 0;
+        for (const auto& range : ranges) {
+            for (size_t i = std::max(next, range.first); i < range.second; ++i) {
+                if (toks[i].kind == Kind::WS && hasLineBreak(toks[i].text)) inlineToken[i] = true;
+            }
+            next = std::max(next, range.second);
+        }
+    }
+};
+
+// 模板头可含默认值。单独识别它的尖括号,避免把结束符 > 当作大于号。
+std::vector<bool> templateHeaderAngles(const LayoutTokens& t) {
+    std::vector<bool> angles(t.code.size());
+    for (size_t i = 1; i < t.code.size(); ++i) {
+        if (t[i - 1] != "template" || t[i] != "<") continue;
+        int depth = 1;
+        for (size_t j = i + 1; j < t.code.size(); j = t.afterGroup(j)) {
+            const auto& s = t[j];
+            if (t.code[j]->kind == Kind::RAW || s == ";" || s == "}") break;
+            if (s == "<") ++depth;
+            else if (s == ">") --depth;
+            else if (s == ">>") depth -= 2;
+            if (depth <= 0) {
+                angles[i] = angles[j] = true;
+                break;
+            }
+        }
+    }
+    return angles;
+}
+
+// 连接赋值、流、算术、比较、逻辑等表达式。标签、访问说明和代码块边界仍然分行。
+void joinOperatorLines(const LayoutTokens& t, LineJoins& joins) {
+    static const std::unordered_set<std::string> operators = {
+        "=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<=", ">>=",
+        "+", "-", "*", "/", "%", "<<", ">>", "^", "&", "|", "&&", "||",
+        "<", ">", "<=", ">=", "==", "!=", "<=>", "?", ".", "->", ".*", "->*", "::",
+        "and", "or", "xor", "bitand", "bitor", "and_eq", "or_eq", "xor_eq", "not_eq",
+    };
+
+    const auto headerAngles = templateHeaderAngles(t);
+    std::vector<size_t> conditionals;
+    for (size_t i = 0; i < t.code.size(); ++i) {
+        const auto& s = t[i];
+        bool ternaryColon = s == ":" && !conditionals.empty() &&
+                            conditionals.back() == t.parent[i];
+        if (ternaryColon) conditionals.pop_back();
+        else if (s == "?") conditionals.push_back(t.parent[i]);
+
+        if (!ternaryColon && !operators.count(s)) continue;
+        if (headerAngles[i] || t.code[i]->topen || t.code[i]->tclose ||
+            (i > 0 && t[i - 1] == "operator")) continue;
+
+        if (i > 0) {
+            const auto& left = t[i - 1];
+            if (left != ";" && left != "," && left != "{" && left != "<%" && left != "}" &&
+                left != "%>" && left != "(" && left != "[" && left != "<:" &&
+                left != ":" && left != "else" && left != "do" && !followsStatementHeader(t, i - 1)) {
+                joins.between(t.source[i - 1], t.source[i]);
+            }
+        }
+        if (i + 1 < t.code.size()) {
+            const auto& right = t[i + 1];
+            if (right != ";" && right != ")" && right != "]" && right != "}" && right != "%>") {
+                joins.between(t.source[i], t.source[i + 1]);
+            }
+        }
+    }
+}
+
+void removeSingleLineControlBraces(const LayoutTokens& t, const std::vector<Token>& toks,
+                                  std::vector<bool>& inlineToken) {
+    auto macros = definedMacros(toks);
+    for (size_t open = 0; open < t.code.size(); ++open) {
+        if (t[open] != "(" || t.mate[open] == noToken || !opensControlHeader(t, open)) continue;
+        size_t close = t.mate[open];
+        size_t brace = close + 1;
+        if (!t.opensBlock(brace) || t.mate[brace] == noToken) continue;
+        size_t end = t.mate[brace];
+        if (!isSingleLineBody(t, toks, inlineToken, macros, brace + 1, end)) continue;
+        if (!onlyWhitespace(toks, t.source[close] + 1, t.source[brace]) ||
+            !onlyWhitespace(toks, t.source[brace] + 1, t.source[brace + 1]) ||
+            !onlyWhitespace(toks, t.source[end - 1] + 1, t.source[end])) continue;
+        std::fill(inlineToken.begin() + t.source[close] + 1,
+                  inlineToken.begin() + t.source[brace + 1], true);
+        std::fill(inlineToken.begin() + t.source[end - 1] + 1,
+                  inlineToken.begin() + t.source[end] + 1, true);
+    }
+}
+
+std::map<size_t, std::string> applyLayout(std::vector<Token>& toks, const std::string& eol) {
+    LayoutTokens t(toks);
+    LineJoins joins(toks);
+    joinOperatorLines(t, joins);
+
+    std::vector<std::pair<size_t, size_t>> functionClosers;
+    for (size_t open = 0; open < t.code.size(); ++open) {
+        if (t[open] != "(" || t.mate[open] == noToken) continue;
+        size_t close = t.mate[open];
+        if (isCallOrParameterList(t, open)) joins.between(t.source[open - 1], t.source[close]);
+        if (opensControlHeader(t, open)) continue;
+
+        size_t scope = t.parent[open];
+        if (scope != noToken && !t.opensBlock(scope)) continue;
+        FunctionName name = findFunctionName(t, open);
+        if (name.first == noToken || !hasFunctionPrefix(t, name, scope)) continue;
+        size_t end = findFunctionEnd(t, close);
+        if (end == noToken) continue;
+        bool definition = t.opensBlock(end);
+        if (!definition && !isFunctionDeclaration(t, open, close)) continue;
+
+        joins.between(t.source[name.first], t.source[definition ? end : close]);
+        if (definition) functionClosers.emplace_back(t.source[t.mate[end]], t.source[name.first]);
+    }
+
+    std::vector<bool> inlineToken(toks.size());
+    joins.mark(inlineToken);
+    // 先合并续行,再判断控制块的语句是否已成为单行。
+    removeSingleLineControlBraces(t, toks, inlineToken);
+
+    std::map<size_t, std::string> closingLines;
+    for (const auto& closer : functionClosers) {
+        size_t brace = closer.first;
+        if (inlineToken[brace - 1] || toks[brace - 1].kind != Kind::WS ||
+            !hasLineBreak(toks[brace - 1].text)) {
+            closingLines.emplace(brace, eol + lineIndent(toks, closer.second));
+        }
+    }
+    for (size_t i = 0; i < toks.size(); ++i) {
+        if (inlineToken[i]) toks[i] = {Kind::WS, " "};
+    }
+    return closingLines;
+}
+
+std::string compact(const std::string& text) {
+    std::vector<Token> before = tokenize(text);
+    size_t newline = text.find('\n');
+    std::string eol = newline != std::string::npos && newline > 0 &&
+                      text[newline - 1] == '\r' ? "\r\n" : "\n";
+    markTemplateClosers(before);
+    auto closingLines = applyLayout(before, eol);
+    markControlClosers(before);
+    std::string out = render(before, closingLines);
+    std::vector<Token> after = tokenize(out);
+    if (signature(before) != signature(after)) {
+        throw std::runtime_error("压缩后 token 序列发生变化,已放弃(请反馈该源文件)");
+    }
+    return out;
+}
+
+// ============================ 变量识别与重命名 ============================
 
 // 从 start 尝试解析一条声明,把变量名追加到 vars、函数名追加到 funcs
 void tryParseDeclaration(const std::vector<const Token*>& t, size_t start,
